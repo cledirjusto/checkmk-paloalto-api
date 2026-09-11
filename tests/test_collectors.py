@@ -354,3 +354,18 @@ def test_bgp_peer_address_keeps_ipv6_intact(agent):
     assert agent._bgp_peer_address("203.0.113.1:179") == "203.0.113.1"
     assert agent._bgp_peer_address("2001:db8::1") == "2001:db8::1"
     assert agent._bgp_peer_address("") == ""
+
+
+def test_nothing_is_cached_outside_a_site(agent, monkeypatch):
+    """The agent must never write outside the site directory.
+
+    Without OMD_ROOT and without an explicit --cache-dir there is no safe
+    place to write, so caching is off rather than falling back to /tmp.
+    """
+    monkeypatch.delenv("OMD_ROOT", raising=False)
+    assert agent._cache_file(None, "10.1.1.1", 443) is None
+
+    monkeypatch.setenv("OMD_ROOT", "/omd/sites/mysite")
+    path = agent._cache_file(None, "10.1.1.1", 443)
+    assert path is not None
+    assert str(path).startswith("/omd/sites/mysite/var/check_mk/")

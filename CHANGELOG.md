@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-11
+
+### Fixed
+
+- The object-count cache could be written outside the site directory. Without
+  `OMD_ROOT` and without an explicit `--cache-dir` it fell back to a temporary
+  directory; inside a site that never happened, but writing outside the site is
+  something the Checkmk Exchange review rejects, and rightly so. Caching is now
+  simply switched off in that case.
+
+### Changed
+
+- The README no longer implies that 2.4 and 2.5 were tested. The extension uses
+  only plug-in APIs that are identical across 2.3, 2.4 and 2.5, but it has been
+  verified on 2.3.0p49 only.
+
+## [1.0.0] - 2026-09-11
+
+Released as `v1.0.0`. Built on an unreleased internal version of the same
+number, whose original feature set is listed at the bottom; everything here is
+what changed on the way to the first public release.
+
 ### Removed
 
 - The `Power Rail` services: 29 of them on a PA-5410, reporting one thing
@@ -127,7 +149,7 @@ assumptions the code made.
 - `tests/panos_api_stub.py`, an HTTPS stand-in for the PAN-OS XML API, so the
   special agent can be run end to end without a firewall.
 
-## [1.0.0] - 2026-09-10
+## [0.1.0] - 2026-09-10 (internal, never released)
 
 ### Added
 
@@ -147,5 +169,6 @@ assumptions the code made.
 - Metrics, graphs and perf-o-meters for all numeric values, plus a
   `paloalto_healthy` 1/0 metric on the state-only services.
 
-[Unreleased]: https://github.com/cledirjusto/checkmk-paloalto-api/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/cledirjusto/checkmk-paloalto-api/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/cledirjusto/checkmk-paloalto-api/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/cledirjusto/checkmk-paloalto-api/releases/tag/v1.0.0

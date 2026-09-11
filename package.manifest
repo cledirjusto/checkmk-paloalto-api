@@ -32,7 +32,7 @@
     },
     "name": "paloalto_api",
     "title": "Palo Alto Networks firewalls via PAN-OS XML API",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "version.min_required": "2.3.0",
     "version.packaged": "checkmk-paloalto-api build_mkp.py",
     "version.usable_until": null

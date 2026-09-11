@@ -63,7 +63,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -74,7 +73,7 @@ from typing import Any
 import requests
 import urllib3
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 ALL_SECTIONS = (
     "system",
@@ -476,15 +475,21 @@ def parse_system_state(text: str) -> dict[str, str]:
     return out
 
 
-def _cache_file(cache_dir: str | None, host: str, port: int) -> Path:
-    """Where the object counts of one firewall are cached."""
+def _cache_file(cache_dir: str | None, host: str, port: int) -> Path | None:
+    """Where the object counts of one firewall are cached.
+
+    Nothing is ever written outside the site directory: inside a site the
+    cache lives under ``$OMD_ROOT/var/check_mk`` (var/ survives a restart,
+    tmp/ does not). Run outside a site without an explicit ``--cache-dir``,
+    caching is simply switched off rather than falling back to a temporary
+    directory.
+    """
     if cache_dir:
         base = Path(cache_dir)
     elif omd_root := os.environ.get("OMD_ROOT"):
-        # var/ survives a site restart, tmp/ does not
         base = Path(omd_root) / "var/check_mk/paloalto_api"
     else:
-        base = Path(tempfile.gettempdir()) / "paloalto_api_cache"
+        return None
     safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", host)
     return base / f"counts_{safe_host}_{port}.json"
 
@@ -1135,7 +1140,11 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-dir",
-        help="Where to keep the cache (default: $OMD_ROOT/var/check_mk/paloalto_api)",
+        help=(
+            "Where to keep the cache. Defaults to "
+            "$OMD_ROOT/var/check_mk/paloalto_api inside a site; outside a site "
+            "caching is off unless this is given."
+        ),
     )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--version", action="version", version=__version__)

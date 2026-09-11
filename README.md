@@ -1,7 +1,7 @@
 # Palo Alto Networks firewalls via PAN-OS XML API – Checkmk extension
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](LICENSE)
-![Checkmk 2.3 / 2.4 / 2.5](https://img.shields.io/badge/Checkmk-2.3%20%7C%202.4%20%7C%202.5-green)
+![Checkmk 2.3+](https://img.shields.io/badge/Checkmk-2.3%2B-green)
 
 A Checkmk special agent plus check plug-ins for Palo Alto Networks firewalls,
 built to **complement Checkmk's SNMP checks rather than duplicate them**.
@@ -17,9 +17,10 @@ The API key is read from the **Checkmk password store** – it never appears on
 the command line, in the process list or in the fetcher configuration.
 
 Verified against a **PA-5410 (PAN-OS 11.2.13-h1)** and a **PA-5220 (PAN-OS
-11.2.13)**, both in active/passive HA pairs, on a Checkmk 2.3.0p49 site. It
-should work with any PAN-OS 9.x–11.x device, including VM-Series, that exposes
-the XML API.
+11.2.13)**, both in active/passive HA pairs, on a **Checkmk 2.3.0p49** site. It
+uses only plug-in APIs that are identical on 2.3, 2.4 and 2.5, so it should run
+unchanged there, but 2.4 and 2.5 have not been tested. It should work with any
+PAN-OS 9.x–11.x device, including VM-Series, that exposes the XML API.
 
 ## Services
 
@@ -76,8 +77,8 @@ nothing about configuration capacity.
 2. Install it on the central site:
 
    ```
-   OMD[mysite]:~$ mkp add paloalto_api-1.0.0.mkp
-   OMD[mysite]:~$ mkp enable paloalto_api 1.0.0
+   OMD[mysite]:~$ mkp add paloalto_api-1.0.1.mkp
+   OMD[mysite]:~$ mkp enable paloalto_api 1.0.1
    ```
 
    or use *Setup → Maintenance → Extension packages* in the commercial editions.

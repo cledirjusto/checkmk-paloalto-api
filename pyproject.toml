@@ -1,6 +1,6 @@
 [project]
 name = "checkmk-paloalto-api"
-version = "1.0.0"
+version = "1.0.1"
 description = "Checkmk extension: monitor Palo Alto Networks firewalls through the PAN-OS XML API"
 readme = "README.md"
 authors = [{ name = "John Jimenez" }, { name = "Cledir Justo" }]
