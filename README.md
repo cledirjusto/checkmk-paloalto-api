@@ -13,7 +13,7 @@ not expose: configuration capacity, licences, BGP peers, per-tunnel VPN state,
 per-gateway GlobalProtect users, public IP address usage, HA detail and power
 supplies.
 
-The API key is read from the **Checkmk password store** – it never appears on
+The API key is read from the **Checkmk password store**, so it never appears on
 the command line, in the process list or in the fetcher configuration.
 
 Verified against a **PA-5410 (PAN-OS 11.2.13-h1)** and a **PA-5220 (PAN-OS
@@ -40,24 +40,6 @@ PAN-OS 9.x–11.x device, including VM-Series, that exposes the XML API.
 
 On the **passive member of an HA pair** VPN tunnels are down by design; the VPN
 services are OK there by default.
-
-### Deliberately not collected
-
-These were removed after comparing a real SNMP walk of the same firewall
-against this plug-in's output, service by service. Everything below is covered
-at least as well by a check Checkmk already ships:
-
-| Left to SNMP | Checkmk check that covers it |
-| --- | --- |
-| Interfaces | *Interface ...* via IF-MIB – real aliases, correct link aggregation |
-| Fans, temperature sensors | *Fan Sensor ...*, *Temperature Sensor ...* |
-| Session table | *Palo Alto Sessions* |
-| CPU, memory, filesystems | *CPU utilization*, *Memory*, *Filesystem ...* |
-| Total GlobalProtect users | *Palo Alto Users* – it also knows the licensed maximum |
-
-Voltage rails and the ARP entry count were dropped outright: 29 services for the
-rails reporting one thing between them, and an ARP table fill level that says
-nothing about configuration capacity.
 
 ## Requirements
 
@@ -204,29 +186,6 @@ goes stale.
 
 At a one minute check interval this is the difference between 1440 full
 configuration reads a day and one.
-
-## Migrating from the SNMP / script based setup
-
-| Old script | New service |
-| --- | --- |
-| `capacity-*.sh <fw> RULE <max>` | `Capacity Security rules` |
-| `capacity-*.sh <fw> NAT <max>` / `NATDIPP` | `Capacity NAT rules` / `Capacity NAT DIPP rules` |
-| `capacity-*.sh <fw> ZONE / ADDRESS / ADDRESSGROUP / SERVICE / SERVICEGROUP` | `Capacity Zones / Address objects / Address groups / Service objects / Service groups` |
-| `capacity-*.sh <fw> ARP <max>` | – dropped, see *Deliberately not collected* |
-| `capacity-*.sh <fw> INTERFACE10G / INTERFACE40G` | – dropped, the SNMP interface checks cover link state |
-| `script-power-pa.sh <ip>` | `Power Supply …` |
-| `script-throughput-pa.sh <warn> <crit> <max>` | `Throughput` – set the levels in the rule *Palo Alto throughput* |
-| `script-crontab-public-ip-pa.sh` | `Public IP <network>` – same three sources (NAT rules, ARP table, logical interfaces), de-duplicated and counted against the block size |
-| – | `VPN IKE …`, `VPN IPsec …`, `BGP Peer …`, `HA State`, `License …`, `GlobalProtect …`, `PAN-OS System` |
-
-The `<max>` values the scripts took are no longer needed: the firewall reports
-its own limits. Two differences from the shell scripts are deliberate:
-
-* The public IP count reads NAT rules from **every vsys rulebase plus the shared
-  one**. The old script only looked at `vsys1`, so a NAT rule in the shared
-  rulebase was never counted. Expect a higher number.
-* Object counts include the `shared` section and Panorama-pushed pre/post
-  rulebases.
 
 ## How it works
 
