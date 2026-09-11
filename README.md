@@ -241,7 +241,45 @@ Worth knowing, because they are not obvious and they cost real debugging time:
 * **BGP peer name and virtual router are attributes of `<entry>`,** and the
   prefix counters sit two levels below the peer, one entry per address family.
 
+## Reporting a problem on hardware we have not tested
+
+PAN-OS answers differently across models and versions, and not in ways the
+documentation warns you about. Two firewalls on the *same* PAN-OS build
+returned the configuration limits in different number bases; one model names
+the fan section `<fans>` where another uses `<fan>`. Every one of those
+differences produced missing services rather than an error message.
+
+So if a service is missing or a value looks wrong on your device, the useful
+thing to attach to an issue is not a description, it is what your firewall
+actually replied:
+
+```
+python3 -m venv .venv && .venv/bin/pip install requests
+.venv/bin/python scripts/capture_panos.py --host <ip> --api-key '<key>' \
+      --no-cert-check --out capture/
+cat capture/REPORT.txt
+```
+
+`REPORT.txt` names your model and PAN-OS version, then lists every field the
+agent accepts under more than one spelling and says which one your firewall
+uses. It also separates a field that is genuinely absent from one whose
+command the device refused, which look identical in the data and mean opposite
+things. That one file is usually enough to find the problem.
+
+**It is safe to share.** The tool issues GET only, and any other verb is
+refused before it leaves your machine. IP addresses, serial numbers and
+hostnames are replaced by stable placeholders and MAC addresses are blanked;
+the mapping that would undo this is written to `capture/MAPPING.txt`, which
+stays on your machine and should not be attached. `show config running` is
+reduced to element counts and a tag skeleton, never rule or object names, and
+the ARP table is not queried at all. Read the `.xml` files before posting them
+anyway: zone, tunnel and gateway names are kept, because they are what make the
+structure readable, and yours may be more revealing than ours.
+
 ## Development
+
+Nothing in this section ships to a site: the `.mkp` contains only the files
+under `local/`. `tests/` and `scripts/` exist for working on the extension.
 
 ```
 git clone https://github.com/cledirjusto/checkmk-paloalto-api
@@ -252,14 +290,14 @@ python3 -m venv .venv && .venv/bin/pip install pytest pydantic requests ruff
 python3 scripts/build_mkp.py --update-manifest   # -> dist/paloalto_api-<version>.mkp
 ```
 
-The repository mirrors the site layout: everything under `local/` can be copied
-1:1 into `~/local/` of a site, then packaged there with
-`mkp package package.manifest` or, without a site, with `scripts/build_mkp.py`.
+The repository mirrors the site layout, so everything under `local/` can also be
+copied 1:1 into `~/local/` of a site and packaged there with
+`mkp package package.manifest`.
 
-### Testing without a firewall
+### Running the agent without a firewall
 
-`tests/panos_api_stub.py` serves canned PAN-OS responses over HTTPS, so the
-agent can be run end to end with no hardware:
+`tests/panos_api_stub.py` serves canned PAN-OS responses over HTTPS, so changes
+can be tried end to end without pointing anything at production:
 
 ```
 .venv/bin/python tests/panos_api_stub.py --port 8443 &
@@ -267,35 +305,10 @@ agent can be run end to end with no hardware:
       --host 127.0.0.1 --port 8443 --api-key TESTKEY --no-cert-check
 ```
 
-The check functions are tested too, against `tests/cmk_stub.py` — a stand-in for
-`cmk.agent_based.v2` that keeps the real API's validation rules. Without it the
-check functions could only be exercised inside a site, which is how a `Result`
-built with two mutually exclusive arguments once reached a production firewall.
-
-### Capturing what a real firewall answers
-
-`scripts/capture_panos.py` records the responses of a live device so the
-fixtures can be based on them rather than on assumptions:
-
-```
-.venv/bin/python scripts/capture_panos.py --host <ip> --api-key '<key>' \
-      --no-cert-check --out capture/
-cat capture/REPORT.txt
-```
-
-It issues **GET only** — any other verb is refused before it leaves the machine
-— and sanitises the output: IP addresses, serial numbers and hostnames become
-stable placeholders and MAC addresses are blanked. The mapping that would undo
-this is written to `capture/MAPPING.txt`, which stays local.
-
-Two commands are handled specially. `show config running` is reduced to element
-counts and a tag skeleton, never rule or object names. The ARP table is not
-queried at all.
-
-`REPORT.txt` names the device, then lists every field where the agent accepts
-more than one spelling and says which one this firewall actually uses. It
-distinguishes a field that is absent from a command the device refused – those
-look the same in the data and mean opposite things.
+The check functions are covered too, against `tests/cmk_stub.py`, a stand-in for
+`cmk.agent_based.v2` that keeps the real API's validation rules. Without it they
+could only be exercised inside a site, which is how a `Result` built with two
+mutually exclusive arguments once reached a production firewall.
 
 To release, bump `version` in `package.manifest`, `pyproject.toml` and
 `__version__` in the agent, update `CHANGELOG.md`, tag `v<version>`; the GitHub
