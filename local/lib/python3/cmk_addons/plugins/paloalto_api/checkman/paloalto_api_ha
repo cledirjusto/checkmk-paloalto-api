@@ -1,0 +1,16 @@
+title: Palo Alto Networks: High availability state
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Monitors the high availability state of a firewall that is part of an HA
+ pair. The service is OK if the local member is active or passive (or
+ active-primary/active-secondary for active/active), WARN for initial or
+ tentative and CRIT for suspended, non-functional and other states. The peer
+ state and the peer connection are checked the same way. A configuration that
+ is not synchronized results in WARN by default. Optionally an expected local
+ state can be configured to detect an unplanned failover.
+
+discovery:
+ One service is created if HA is enabled on the firewall.

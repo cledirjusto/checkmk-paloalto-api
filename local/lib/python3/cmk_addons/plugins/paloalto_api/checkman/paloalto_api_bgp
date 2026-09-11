@@ -1,0 +1,23 @@
+title: Palo Alto Networks: BGP peer state
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Reports the state of every BGP peer the firewall has configured, read with
+ "show routing protocol bgp peer" (or "show advanced-routing bgp peer-status"
+ on devices running Advanced Routing). A peer is OK when its session is
+ "Established"; the states it passes through on the way up (Idle, Connect,
+ Active, OpenSent, OpenConfirm) are WARN by default and anything else is
+ CRIT. Both can be changed in the rule "Palo Alto BGP peers", together with
+ lower levels on the session uptime, which catches a peer that keeps
+ flapping, and on the number of prefixes received.
+
+ PAN-OS does not expose BGP peer state over SNMP, so this has no equivalent
+ among the SNMP based checks.
+
+item:
+ The peer name as configured on the firewall.
+
+discovery:
+ One service per BGP peer. No service is created if BGP is not configured.

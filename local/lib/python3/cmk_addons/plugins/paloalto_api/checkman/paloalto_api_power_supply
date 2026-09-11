@@ -1,0 +1,15 @@
+title: Palo Alto Networks: Power supplies
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Monitors the power supplies reported by "show system environmentals". The
+ service is CRIT if the power supply reports an alarm and WARN (configurable)
+ if it is not inserted.
+
+item:
+ Slot and description of the power supply, e.g. "Slot1 Power Supply #1 (left)".
+
+discovery:
+ One service is created per power supply.

@@ -1,0 +1,12 @@
+title: Palo Alto Networks: Licenses and subscriptions\nagents: paloalto_api\ncatalog: hw/network/paloalto\nlicense: GPLv2\ndistribution: checkmk-paloalto-api\ndescription:
+ Monitors the licenses and subscriptions installed on a firewall ("request
+ license info"), e.g. Threat Prevention, Advanced URL Filtering, WildFire,
+ GlobalProtect, DNS Security or the support contract. The remaining lifetime
+ is checked against lower levels (default 30/7 days); an expired license is
+ CRIT (configurable). Perpetual licenses are always OK.
+
+item:
+ The license feature name.
+
+discovery:
+ One service is created per installed license.

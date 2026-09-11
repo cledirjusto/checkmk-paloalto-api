@@ -1,0 +1,29 @@
+title: Palo Alto Networks: Public IP address usage
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Counts how many addresses of an allocated public block are in use, so that a
+ block running out is noticed before it does. An address counts as used when
+ it appears in a NAT rule (every vsys rulebase plus the shared one, read
+ through a scoped xpath), in the ARP table, or on a logical interface. The
+ same address is counted once no matter how often it occurs.
+
+ By default the usable size of the block is the denominator, that is the size
+ minus its network and broadcast address. If the block is routed to the
+ firewall rather than on-link, every address can be handed out; set "Count the
+ network and broadcast address as usable" in the rule "Palo Alto public IP
+ addresses" for that. Default levels are 80/90 percent; lower levels on the
+ number of free addresses can be set instead, which is usually the more
+ natural way to think about a small block.
+
+ Only blocks the firewall itself can see are counted. Addresses that live on
+ another device, a border router for example, do not appear in any of the
+ three sources and would be reported as unused.
+
+item:
+ The network in CIDR notation, e.g. "203.0.113.0/24".
+
+discovery:
+ One service per network configured in the special agent rule.

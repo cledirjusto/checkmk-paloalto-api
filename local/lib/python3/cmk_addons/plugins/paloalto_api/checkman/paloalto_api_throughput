@@ -1,0 +1,12 @@
+title: Palo Alto Networks: Throughput
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Monitors the total throughput (bit/s) and packet rate of the dataplane as
+ reported by "show session info". Levels can be configured in Mbit/s and
+ packets per second. No levels are set by default.
+
+discovery:
+ One service is created per firewall.

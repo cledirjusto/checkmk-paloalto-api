@@ -1,0 +1,21 @@
+title: Palo Alto Networks: Configuration capacity
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Counts configured objects in the running configuration (all virtual systems,
+ shared objects and Panorama pushed rules): security rules, NAT rules, NAT
+ rules with dynamic IP and port translation, address objects and groups,
+ service objects and groups, zones and virtual systems. Each count is compared
+ to the limit the firewall reports for its model ("show system state filter
+ cfg.general.max-*"). Default levels are 80/90 percent of the limit. If the device does
+ not report a limit for an object type, the limit can be set in the rule
+ "Palo Alto capacity", otherwise only the absolute count is shown.
+
+item:
+ The object type, e.g. "Security rules", "NAT rules", "Address objects"
+ or "Zones".
+
+discovery:
+ One service is created per object type the agent was able to count.

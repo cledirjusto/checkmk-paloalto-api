@@ -1,0 +1,39 @@
+{
+    "author": "John Jimenez & Cledir Justo",
+    "description": "Monitor Palo Alto Networks firewalls (PA-5220, PA-5410, ...) through the PAN-OS XML API instead of SNMP: system info, HA state, sessions and throughput, configuration capacity (security/NAT rules, address and service objects, zones, ARP), power supplies, fans, temperature, public IP presence and the state of IKE gateways (phase 1) and IPsec tunnels (phase 2). The API key is read from the Checkmk password store.",
+    "download_url": "https://github.com/cledirjusto/checkmk-paloalto-api",
+    "files": {
+        "cmk_addons_plugins": [
+            "paloalto_api/agent_based/paloalto_api_bgp.py",
+            "paloalto_api/agent_based/paloalto_api_capacity.py",
+            "paloalto_api/agent_based/paloalto_api_environmentals.py",
+            "paloalto_api/agent_based/paloalto_api_licenses.py",
+            "paloalto_api/agent_based/paloalto_api_public_ip.py",
+            "paloalto_api/agent_based/paloalto_api_sessions.py",
+            "paloalto_api/agent_based/paloalto_api_system.py",
+            "paloalto_api/agent_based/paloalto_api_vpn.py",
+            "paloalto_api/checkman/paloalto_api_bgp",
+            "paloalto_api/checkman/paloalto_api_capacity",
+            "paloalto_api/checkman/paloalto_api_globalprotect",
+            "paloalto_api/checkman/paloalto_api_ha",
+            "paloalto_api/checkman/paloalto_api_license",
+            "paloalto_api/checkman/paloalto_api_power_supply",
+            "paloalto_api/checkman/paloalto_api_public_ip",
+            "paloalto_api/checkman/paloalto_api_system",
+            "paloalto_api/checkman/paloalto_api_throughput",
+            "paloalto_api/checkman/paloalto_api_vpn_ike",
+            "paloalto_api/checkman/paloalto_api_vpn_ipsec",
+            "paloalto_api/graphing/paloalto_api.py",
+            "paloalto_api/libexec/agent_paloalto_api",
+            "paloalto_api/rulesets/check_parameters.py",
+            "paloalto_api/rulesets/special_agent.py",
+            "paloalto_api/server_side_calls/special_agent.py"
+        ]
+    },
+    "name": "paloalto_api",
+    "title": "Palo Alto Networks firewalls via PAN-OS XML API",
+    "version": "1.0.0",
+    "version.min_required": "2.3.0",
+    "version.packaged": "checkmk-paloalto-api build_mkp.py",
+    "version.usable_until": null
+}

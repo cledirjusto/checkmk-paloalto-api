@@ -1,0 +1,1272 @@
+#!/usr/bin/env python3
+#
+# Checkmk special agent for Palo Alto Networks firewalls (PAN-OS XML API)
+#
+# Copyright (C) 2026 The checkmk-paloalto-api authors
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 2 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
+"""
+Special agent for Palo Alto Networks firewalls.
+
+Talks to the PAN-OS XML API (operational + running-config commands) and
+prints Checkmk agent sections. Every section is a single JSON document so
+that the check plug-ins stay small and the agent can grow without breaking
+the section format.
+
+Sections produced (all prefixed with ``paloalto_api_``):
+
+  system          model, serial, PAN-OS version, uptime, content versions
+  ha              high-availability state of this member and its peer
+  sessions        session table usage, throughput (kbps) and packet rate
+  capacity        object counts (rules, NAT, addresses, zones, ...)
+                  together with the limits the device reports for itself
+  environmentals  power supplies, fans, thermal sensors, power rails
+  public_ip       how many addresses of each allocated public block are used
+  vpn_ike         IKE gateways (phase 1) and whether an IKE SA exists
+  vpn_ipsec       IPsec tunnels (phase 2), flow state and active SAs
+  bgp             BGP peers and whether their session is established
+  licenses        installed licenses / subscriptions and their expiry
+  globalprotect   GlobalProtect gateway user statistics (if configured)
+
+Interface traffic, fans, temperature sensors and the session table are
+deliberately NOT collected: Checkmk's SNMP checks already cover those, and
+this agent is meant to complement them rather than duplicate them.
+
+Authentication uses a PAN-OS API key that is sent in the ``X-PAN-KEY``
+header (never in the URL). The key can be passed either in plain text
+(``--api-key``, for testing on the command line) or as a reference into
+the Checkmk password store (``--api-key-id``), which is what the
+server-side-calls plug-in does.
+
+Works with Checkmk 2.3, 2.4 and 2.5 (uses the new password store API on
+2.5+ and falls back to the legacy helper on older versions).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import importlib
+import ipaddress
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+from typing import Any
+
+import requests
+import urllib3
+
+__version__ = "1.0.0"
+
+ALL_SECTIONS = (
+    "system",
+    "ha",
+    "sessions",
+    "capacity",
+    "environmentals",
+    "vpn",
+    "bgp",
+    "licenses",
+    "globalprotect",
+)
+
+# --------------------------------------------------------------------------
+# Password store handling (2.3 / 2.4 legacy helper vs. 2.5+ v1_unstable API)
+# --------------------------------------------------------------------------
+
+
+def _resolve_api_key(plain: str | None, reference: str | None) -> str:
+    """Return the API key, resolving a password-store reference if needed.
+
+    ``reference`` has the form ``<password-id>:<path-to-password-store>``,
+    which is what ``cmk.server_side_calls.v1.Secret`` renders to when it is
+    passed as a bare command line argument.
+    """
+    if plain:
+        return plain
+    if not reference:
+        raise SystemExit("Either --api-key or --api-key-id is required")
+
+    pw_id, _, pw_file = reference.partition(":")
+    if not pw_file:
+        raise SystemExit("--api-key-id must look like <id>:<path-to-password-store>")
+
+    # Checkmk 2.5+: public password store API ('v1_unstable' in 2.5, expected
+    # to be released as 'v1' later on)
+    for module_name in ("cmk.password_store.v1", "cmk.password_store.v1_unstable"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        try:
+            return str(module.dereference_secret(reference).reveal()).strip()
+        except Exception as exc:  # noqa: BLE001 - be permissive, fall back below
+            sys.stderr.write(f"{module_name} lookup failed ({exc}), trying legacy API\n")
+
+    # Checkmk 2.3 / 2.4: legacy helper (removed in 2.7)
+    try:
+        from cmk.utils import password_store  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise SystemExit(f"Cannot import Checkmk password store module: {exc}") from exc
+
+    if hasattr(password_store, "lookup"):
+        return str(password_store.lookup(Path(pw_file), pw_id)).strip()
+    if hasattr(password_store, "extract"):
+        return str(password_store.extract(pw_id)).strip()
+    raise SystemExit("Unsupported Checkmk password store API")
+
+
+# --------------------------------------------------------------------------
+# PAN-OS XML API client
+# --------------------------------------------------------------------------
+
+
+class PanOSError(RuntimeError):
+    pass
+
+
+class PanOSClient:
+    def __init__(
+        self,
+        host: str,
+        api_key: str,
+        *,
+        port: int = 443,
+        verify: bool | str = True,
+        timeout: float = 30.0,
+        debug: bool = False,
+    ) -> None:
+        self._base = f"https://{host}:{port}/api/"
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "X-PAN-KEY": api_key,
+                "User-Agent": f"checkmk-paloalto-api/{__version__}",
+            }
+        )
+        self._verify = verify
+        self._timeout = timeout
+        self._debug = debug
+        if verify is False:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    def _request(self, params: Mapping[str, str]) -> ET.Element:
+        if self._debug:
+            sys.stderr.write(f"GET {self._base}?{urllib.parse.urlencode(params)}\n")
+        resp = self._session.get(
+            self._base, params=params, verify=self._verify, timeout=self._timeout
+        )
+        resp.raise_for_status()
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError as exc:
+            raise PanOSError(f"Invalid XML in API response: {exc}") from exc
+        status = root.get("status")
+        if status != "success":
+            msg = " ".join(t.strip() for t in root.itertext() if t.strip())
+            code = root.get("code", "?")
+            raise PanOSError(f"API error (status={status}, code={code}): {msg[:300]}")
+        result = root.find("result")
+        return result if result is not None else root
+
+    def op(self, cmd: str) -> ET.Element:
+        """Run an operational command given as XML, e.g. ``<show><system>...``."""
+        return self._request({"type": "op", "cmd": cmd})
+
+    def config_get(self, xpath: str) -> ET.Element:
+        return self._request({"type": "config", "action": "get", "xpath": xpath})
+
+    def running_config(self) -> ET.Element:
+        result = self.op("<show><config><running/></config></show>")
+        cfg = result.find("config")
+        return cfg if cfg is not None else result
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def _text(node: ET.Element | None, path: str | None = None, default: str = "") -> str:
+    if node is None:
+        return default
+    target = node.find(path) if path else node
+    if target is None or target.text is None:
+        return default
+    return target.text.strip()
+
+
+def _to_int(value: str | None, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    value = value.strip().replace(",", "")
+    # 'show system state' reports many values in hex ('0x13880' = 80000) and
+    # others in plain decimal. int(value, 0) would handle the prefix but
+    # rejects zero padded decimals, so the prefix is checked explicitly.
+    if value.lower().startswith(("0x", "-0x")):
+        try:
+            return int(value, 16)
+        except ValueError:
+            pass
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return int(float(value))
+        except ValueError:
+            return default
+
+
+def _to_float(value: str | None, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+    try:
+        return float(value.strip().replace(",", ""))
+    except ValueError:
+        return default
+
+
+def _to_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in ("true", "yes", "on", "1", "active"):
+        return True
+    if v in ("false", "no", "off", "0", "inactive"):
+        return False
+    return None
+
+
+def _entry_to_dict(entry: ET.Element) -> dict[str, Any]:
+    """Flatten a PAN-OS ``<entry>`` element into a dict of its child texts."""
+    data: dict[str, Any] = dict(entry.attrib)
+    for child in entry:
+        if len(child) == 0:
+            data[child.tag] = (child.text or "").strip()
+        else:
+            # keep one nesting level as a plain dict; enough for our needs
+            data[child.tag] = {c.tag: (c.text or "").strip() for c in child}
+    return data
+
+
+_UPTIME_RE = re.compile(r"(?:(?P<days>\d+)\s+days?,?\s*)?(?P<h>\d+):(?P<m>\d+):(?P<s>\d+)")
+
+
+def parse_uptime(value: str) -> int | None:
+    """'45 days, 3:12:55' -> seconds"""
+    m = _UPTIME_RE.search(value or "")
+    if not m:
+        return None
+    days = int(m.group("days") or 0)
+    return days * 86400 + int(m.group("h")) * 3600 + int(m.group("m")) * 60 + int(m.group("s"))
+
+
+def emit_section(name: str, payload: Any) -> None:
+    sys.stdout.write(f"<<<paloalto_api_{name}:sep(0)>>>\n")
+    sys.stdout.write(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+    sys.stdout.write("\n")
+
+
+# --------------------------------------------------------------------------
+# Collectors
+# --------------------------------------------------------------------------
+
+
+def collect_system(client: PanOSClient) -> dict[str, Any]:
+    result = client.op("<show><system><info/></system></show>")
+    system = result.find("system")
+    if system is None:
+        system = result
+    wanted = (
+        "hostname",
+        "model",
+        "serial",
+        "sw-version",
+        "app-version",
+        "app-release-date",
+        "av-version",
+        "threat-version",
+        "wildfire-version",
+        "url-filtering-version",
+        "global-protect-client-package-version",
+        "device-dictionary-version",
+        "multi-vsys",
+        "operational-mode",
+        "family",
+        "ip-address",
+        "mac-address",
+        "uptime",
+    )
+    info = {key: _text(system, key) for key in wanted if system.find(key) is not None}
+    info["uptime_sec"] = parse_uptime(info.get("uptime", ""))
+    return info
+
+
+def collect_ha(client: PanOSClient) -> dict[str, Any]:
+    result = client.op("<show><high-availability><state/></high-availability></show>")
+    enabled = _text(result, "enabled", "no").lower() == "yes"
+    data: dict[str, Any] = {"enabled": enabled}
+    if not enabled:
+        return data
+    group = result.find("group")
+    if group is None:
+        return data
+    local = group.find("local-info")
+    peer = group.find("peer-info")
+    data.update(
+        {
+            "mode": _text(local, "mode"),
+            "local_state": _text(local, "state"),
+            "local_state_reason": _text(local, "state-reason"),
+            "local_priority": _to_int(_text(local, "priority")),
+            "local_version": _text(local, "build-rel"),
+            "peer_state": _text(peer, "state"),
+            "peer_state_reason": _text(peer, "state-reason"),
+            "peer_priority": _to_int(_text(peer, "priority")),
+            "peer_version": _text(peer, "build-rel"),
+            "peer_conn_status": _text(peer, "conn-status"),
+            "running_sync": _text(group, "running-sync"),
+            "running_sync_enabled": _text(group, "running-sync-enabled"),
+            "link_monitoring": _text(group, "link-monitoring/enabled"),
+            "path_monitoring": _text(group, "path-monitoring/enabled"),
+        }
+    )
+    return data
+
+
+def collect_sessions(client: PanOSClient) -> dict[str, Any]:
+    result = client.op("<show><session><info/></session></show>")
+    keys_int = (
+        "num-active",
+        "num-max",
+        "num-tcp",
+        "num-udp",
+        "num-icmp",
+        "num-mcast",
+        "num-predict",
+        "num-installed",
+        "num-bcast",
+        "pps",
+        "kbps",
+        "cps",
+        "dis-def",
+        "dis-tcp",
+        "dis-udp",
+    )
+    data: dict[str, Any] = {}
+    for key in keys_int:
+        val = _to_int(_text(result, key, "") or None)
+        if val is not None:
+            data[key.replace("-", "_")] = val
+    return data
+
+
+def _count_config_objects(config: ET.Element) -> dict[str, int]:
+    """Count objects in the running configuration (all vsys + shared)."""
+    counts: dict[str, int] = {
+        "address": 0,
+        "address_group": 0,
+        "service": 0,
+        "service_group": 0,
+        "zone": 0,
+        "security_rule": 0,
+        "nat_rule": 0,
+        "nat_dipp_rule": 0,
+        "vsys": 0,
+    }
+
+    def _count_objects(node: ET.Element | None) -> None:
+        if node is None:
+            return
+        counts["address"] += len(node.findall("address/entry"))
+        counts["address_group"] += len(node.findall("address-group/entry"))
+        counts["service"] += len(node.findall("service/entry"))
+        counts["service_group"] += len(node.findall("service-group/entry"))
+
+    def _count_rules(rulebase: ET.Element | None) -> None:
+        if rulebase is None:
+            return
+        counts["security_rule"] += len(rulebase.findall("security/rules/entry"))
+        nat_rules = rulebase.findall("nat/rules/entry")
+        counts["nat_rule"] += len(nat_rules)
+        for rule in nat_rules:
+            if rule.find("source-translation/dynamic-ip-and-port") is not None:
+                counts["nat_dipp_rule"] += 1
+
+    # local device configuration
+    for device in config.findall("devices/entry"):
+        for vsys in device.findall("vsys/entry"):
+            counts["vsys"] += 1
+            _count_objects(vsys)
+            counts["zone"] += len(vsys.findall("zone/entry"))
+            _count_rules(vsys.find("rulebase"))
+
+    # shared objects and (Panorama pushed) shared rules
+    shared = config.find("shared")
+    if shared is not None:
+        _count_objects(shared)
+        _count_rules(shared.find("pre-rulebase"))
+        _count_rules(shared.find("post-rulebase"))
+
+    # Panorama pushed device-group config (present in running config of
+    # managed firewalls)
+    panorama = config.find("panorama")
+    if panorama is not None:
+        for vsys in panorama.findall("vsys/entry"):
+            _count_objects(vsys)
+            _count_rules(vsys.find("pre-rulebase"))
+            _count_rules(vsys.find("post-rulebase"))
+        _count_objects(panorama)
+        _count_rules(panorama.find("pre-rulebase"))
+        _count_rules(panorama.find("post-rulebase"))
+
+    return counts
+
+
+# Mapping of "cfg.general.max-*" keys reported by ``show system state`` to
+# our object types. PAN-OS spells these slightly differently across
+# versions, so several aliases are listed per type.
+_LIMIT_KEYS: dict[str, tuple[str, ...]] = {
+    "address": ("cfg.general.max-address",),
+    "address_group": ("cfg.general.max-address-group",),
+    "service": ("cfg.general.max-service",),
+    "service_group": ("cfg.general.max-service-group",),
+    "zone": ("cfg.general.max-zone",),
+    "security_rule": ("cfg.general.max-policy-rule", "cfg.general.max-security-rule"),
+    "nat_rule": ("cfg.general.max-nat-policy-rule", "cfg.general.max-nat-rule"),
+    # 'dip' is dynamic-ip-and-port; 'di' (dynamic IP only) is the fallback
+    # for releases that do not report the first one.
+    "nat_dipp_rule": (
+        "cfg.general.max-nat-dipp-rule",
+        "cfg.general.max-dipp-rule",
+        "cfg.general.max-dip-nat-policy-rule",
+        "cfg.general.max-di-nat-policy-rule",
+    ),
+    "vsys": ("cfg.general.max-vsys",),
+}
+
+_SYSSTATE_RE = re.compile(r"^\s*([\w.\-]+):\s*(.+?)\s*$")
+
+
+def parse_system_state(text: str) -> dict[str, str]:
+    """Parse the flat 'key: value' output of 'show system state filter ...'."""
+    out: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        m = _SYSSTATE_RE.match(line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def _cache_file(cache_dir: str | None, host: str, port: int) -> Path:
+    """Where the object counts of one firewall are cached."""
+    if cache_dir:
+        base = Path(cache_dir)
+    elif omd_root := os.environ.get("OMD_ROOT"):
+        # var/ survives a site restart, tmp/ does not
+        base = Path(omd_root) / "var/check_mk/paloalto_api"
+    else:
+        base = Path(tempfile.gettempdir()) / "paloalto_api_cache"
+    safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", host)
+    return base / f"counts_{safe_host}_{port}.json"
+
+
+def _read_counts_cache(path: Path, max_age: float) -> tuple[dict[str, int], int] | None:
+    """Return (counts, timestamp) if the cache exists and is young enough."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        counts = {str(k): int(v) for k, v in payload["counts"].items()}
+        timestamp = int(payload["timestamp"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if max_age and time.time() - timestamp > max_age:
+        return None
+    return counts, timestamp
+
+
+def _write_counts_cache(path: Path, counts: dict[str, int], timestamp: int) -> None:
+    """Store the object counts - only the numbers, never the configuration.
+
+    The running configuration itself is counted in memory and discarded; it
+    must never reach the disk of the monitoring server.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        # write atomically so a concurrent check never reads half a file
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"timestamp": timestamp, "counts": counts}), encoding="utf-8")
+        tmp.chmod(0o600)  # not left to the umask
+        tmp.replace(path)
+    except OSError as exc:
+        sys.stderr.write(f"capacity: cannot write cache {path}: {exc}\n")
+
+
+def collect_capacity(
+    client: PanOSClient,
+    *,
+    cache_path: Path | None = None,
+    cache_age: float = 0.0,
+) -> dict[str, Any]:
+    """Capacity section.
+
+    ``show config running`` is by far the most expensive command the agent
+    issues, and the configuration it counts changes rarely. With
+    ``cache_age`` set, the object counts are re-read only that often and
+    served from ``cache_path`` in between. The device limits and the port
+    link states are always fetched fresh: a port going down must not be
+    hidden by a cache.
+    """
+    data: dict[str, Any] = {"items": {}}
+
+    # Object counts from the running config, possibly from the cache
+    counts: dict[str, int] = {}
+    counts_ts: int | None = None
+    cached = _read_counts_cache(cache_path, cache_age) if cache_path and cache_age else None
+    if cached is not None:
+        counts, counts_ts = cached
+    else:
+        try:
+            counts = _count_config_objects(client.running_config())
+            counts_ts = int(time.time())
+            if cache_path and cache_age:
+                _write_counts_cache(cache_path, counts, counts_ts)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"capacity: cannot read running config: {exc}\n")
+            # fall back to a stale cache rather than losing the services
+            stale = _read_counts_cache(cache_path, 0.0) if cache_path else None
+            if stale is not None:
+                counts, counts_ts = stale
+                sys.stderr.write("capacity: using stale cached object counts\n")
+
+    # Device reported limits
+    limits: dict[str, int] = {}
+    try:
+        state = client.op(
+            "<show><system><state><filter>cfg.general.max-*</filter></state></system></show>"
+        )
+        raw = parse_system_state("".join(state.itertext()))
+        for obj_type, keys in _LIMIT_KEYS.items():
+            for key in keys:
+                val = _to_int(raw.get(key))
+                if val:
+                    limits[obj_type] = val
+                    break
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"capacity: cannot read system state limits: {exc}\n")
+
+    for obj_type, used in counts.items():
+        data["items"][obj_type] = {"used": used, "max": limits.get(obj_type)}
+    if counts_ts is not None:
+        data["counts_timestamp"] = counts_ts
+        data["counts_cache_age"] = int(cache_age)
+
+    return data
+
+
+def collect_environmentals(client: PanOSClient) -> dict[str, Any]:
+    result = client.op("<show><system><environmentals/></system></show>")
+    # only power supplies are turned into services; the rest of the section is
+    # covered by the SNMP checks
+    data: dict[str, list[dict[str, Any]]] = {"power_supply": []}
+    # Only power supplies: fans, temperature sensors and voltage rails are
+    # covered by the SNMP checks, so the rest of this answer is discarded.
+    for categories, key in ((("power-supply",), "power_supply"),):
+        cat = next((c for c in (result.find(name) for name in categories) if c is not None), None)
+        if cat is None:
+            continue
+        for slot in cat:
+            slot_name = slot.tag  # e.g. Slot1
+            for entry in slot.findall("entry"):
+                e = _entry_to_dict(entry)
+                item: dict[str, Any] = {
+                    "slot": slot_name,
+                    "description": e.get("description", ""),
+                    "alarm": _to_bool(e.get("alarm")),
+                }
+                item["inserted"] = _to_bool(e.get("Inserted"))
+                data[key].append(item)
+    return data
+
+
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+# Where NAT rules live. The rulebase of every vsys plus the shared one; a
+# device managed by Panorama also has pre/post rulebases pushed into 'shared'.
+_NAT_XPATHS = (
+    "/config/devices/entry/vsys/entry/rulebase/nat/rules",
+    "/config/shared/pre-rulebase/nat/rules",
+    "/config/shared/post-rulebase/nat/rules",
+)
+
+
+def _match_networks(values: Iterable[str], networks: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Addresses from ``values`` that fall inside one of the given networks."""
+    found: dict[str, set[str]] = {key: set() for key in networks}
+    for value in values:
+        for raw in _IPV4_RE.findall(value or ""):
+            try:
+                addr = ipaddress.ip_address(raw)
+            except ValueError:
+                continue
+            for key, network in networks.items():
+                if addr in network:
+                    found[key].add(raw)
+                    break
+    return found
+
+
+def collect_public_ip(client: PanOSClient, cidrs: Iterable[str]) -> dict[str, Any] | None:
+    """Count how much of each public block is in use.
+
+    An address counts as used if it appears in a NAT rule, in the ARP table or
+    on a logical interface - the same three sources the shell script this
+    replaces looked at. Addresses are de-duplicated: the same one shows up in
+    dozens of NAT rules.
+    """
+    networks: dict[str, Any] = {}
+    for cidr in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr.strip(), strict=False)
+        except ValueError as exc:
+            sys.stderr.write(f"public_ip: ignoring '{cidr}': {exc}\n")
+            continue
+        networks[str(network)] = network
+    if not networks:
+        return None
+
+    per_source: dict[str, dict[str, set[str]]] = {}
+
+    # NAT rules, read through a scoped xpath instead of the whole running
+    # config - far cheaper, and it is where most public addresses live
+    nat_text: list[str] = []
+    for xpath in _NAT_XPATHS:
+        try:
+            nat_text.append("".join(client.config_get(xpath).itertext()))
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"public_ip: NAT xpath {xpath} failed: {exc}\n")
+    per_source["nat"] = _match_networks(nat_text, networks)
+
+    # ARP table: only the <ip> elements, never the rest of the table
+    try:
+        arp = client.op("<show><arp><entry name='all'/></arp></show>")
+        per_source["arp"] = _match_networks((e.text or "" for e in arp.iter("ip")), networks)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"public_ip: cannot read ARP table: {exc}\n")
+        per_source["arp"] = {key: set() for key in networks}
+
+    # addresses configured on logical interfaces
+    try:
+        logical = client.op("<show><interface>logical</interface></show>")
+        per_source["interface"] = _match_networks(
+            (e.text or "" for e in logical.iter() if e.tag in ("ip", "addr", "dyn-addr")),
+            networks,
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"public_ip: cannot read logical interfaces: {exc}\n")
+        per_source["interface"] = {key: set() for key in networks}
+
+    out: dict[str, Any] = {}
+    for key, network in networks.items():
+        used = set().union(*(per_source[s][key] for s in per_source))
+        # the network and broadcast address of an on-link block cannot be
+        # assigned; /31 and /32 have no such reservation
+        usable = network.num_addresses - 2 if network.prefixlen < 31 else network.num_addresses
+        out[key] = {
+            "used": len(used),
+            "usable": usable,
+            "total": network.num_addresses,
+            "by_source": {s: len(per_source[s][key]) for s in sorted(per_source)},
+        }
+    return {"networks": out}
+
+
+def _ike_params(entry: Mapping[str, Any]) -> tuple[Mapping[str, str], str]:
+    """PAN-OS nests the gateway parameters in a <v1> or <v2> element.
+
+    The element name is also the only place the IKE version is stated, so it
+    is returned alongside.
+    """
+    for tag, version in (("v2", "IKEv2"), ("v1", "IKEv1")):
+        block = entry.get(tag)
+        if isinstance(block, dict):
+            return block, version
+    return {}, ""
+
+
+def _peer_id_address(value: str | None) -> str:
+    """'203.0.113.60(ipaddr:203.0.113.60)' -> '203.0.113.60'."""
+    return (value or "").split("(", 1)[0].strip()
+
+
+# Proxy IDs (the phase 2 traffic selectors) are configuration, not state, so
+# they come from the config tree rather than from a 'show' command. They live
+# under network/, not under vsys/.
+_IPSEC_TUNNEL_XPATH = "/config/devices/entry/network/tunnel/ipsec"
+
+
+def collect_proxy_ids(client: PanOSClient) -> dict[str, dict[str, Any]]:
+    """{'<tunnel>:<proxy-id>': {'local': ..., 'remote': ...}} for every tunnel."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        result = client.config_get(_IPSEC_TUNNEL_XPATH)
+    except Exception as exc:  # noqa: BLE001 - the networks are extra information
+        sys.stderr.write(f"vpn: cannot read the proxy IDs: {exc}\n")
+        return out
+    for tunnel in result.iter("entry"):
+        tunnel_name = tunnel.get("name") or ""
+        auto_key = tunnel.find("auto-key")
+        if not tunnel_name or auto_key is None:
+            continue
+        gateway = ""
+        gw = auto_key.find("ike-gateway/entry")
+        if gw is not None:
+            gateway = gw.get("name") or ""
+        for proxy in auto_key.findall("proxy-id/entry"):
+            proxy_name = proxy.get("name") or ""
+            if not proxy_name:
+                continue
+            out[f"{tunnel_name}:{proxy_name}"] = {
+                "local": _text(proxy, "local"),
+                "remote": _text(proxy, "remote"),
+                "gateway": gateway,
+                "crypto_profile": _text(auto_key, "ipsec-crypto-profile"),
+            }
+    return out
+
+
+def collect_vpn(client: PanOSClient, ha_passive: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+    # ---- phase 1: gateways + IKE SAs ----
+    gateways: dict[str, dict[str, Any]] = {}
+    try:
+        gw_result = client.op("<show><vpn><gateway/></vpn></show>")
+        for entry in gw_result.iter("entry"):
+            e = _entry_to_dict(entry)
+            name = e.get("name") or e.get("gateway") or ""
+            if not name:
+                continue
+            params, ike_version = _ike_params(e)
+            gateways[name] = {
+                "name": name,
+                "id": _to_int(e.get("id") or e.get("gwid")),
+                "peer_address": (
+                    e.get("peer-address")
+                    or e.get("peer-ip")
+                    or _peer_id_address(params.get("peer-id"))
+                ),
+                "local_address": (
+                    e.get("local-address")
+                    or e.get("local-ip")
+                    or _peer_id_address(params.get("local-id"))
+                ),
+                "protocol": e.get("protocol") or e.get("ike-version") or ike_version,
+                "interface": e.get("interface", ""),
+                "ike_sa": None,
+            }
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"vpn: cannot read IKE gateways: {exc}\n")
+
+    try:
+        sa_result = client.op("<show><vpn><ike-sa/></vpn></show>")
+        for entry in sa_result.iter("entry"):
+            e = _entry_to_dict(entry)
+            name = e.get("name") or e.get("gateway") or ""
+            if not name:
+                continue
+            sa = {
+                "role": e.get("role", ""),
+                "created": e.get("created", ""),
+                "expires": e.get("expires", ""),
+                "lifetime": e.get("lifetime", ""),
+                "algo": {
+                    "enc": e.get("algo-enc") or e.get("algo") or "",
+                    "hash": e.get("algo-hash") or e.get("hash") or "",
+                    "dh": e.get("algo-dh") or e.get("dh") or "",
+                    "auth": e.get("auth") or "",
+                },
+                "version": e.get("ike-version") or e.get("version") or e.get("mode") or "",
+            }
+            gateways.setdefault(name, {"name": name, "ike_sa": None})["ike_sa"] = sa
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"vpn: cannot read IKE SAs: {exc}\n")
+
+    ike = {"ha_passive": ha_passive, "gateways": list(gateways.values())}
+
+    # ---- phase 2: tunnels (flow) + IPsec SAs ----
+    tunnels: dict[str, dict[str, Any]] = {}
+    try:
+        flow = client.op("<show><vpn><flow/></vpn></show>")
+        ipsec = flow.find("IPSec")
+        container = ipsec if ipsec is not None else flow
+        for entry in container.iter("entry"):
+            e = _entry_to_dict(entry)
+            name = e.get("name", "")
+            if not name:
+                continue
+            tunnels[name] = {
+                "name": name,
+                "id": _to_int(e.get("id") or e.get("tid")),
+                "gateway_id": _to_int(e.get("gwid")),
+                "state": (e.get("state") or "").lower(),
+                "inner_if": e.get("inner-if", ""),
+                "outer_if": e.get("outer-if", ""),
+                "local_ip": e.get("localip", ""),
+                "peer_ip": e.get("peerip", ""),
+                "monitor": e.get("mon") or e.get("monitor") or "",
+                "monitor_status": e.get("mon-status") or e.get("monitor-status") or "",
+                "sas": [],
+            }
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"vpn: cannot read VPN flows: {exc}\n")
+
+    tunnels_by_id = {t["id"]: t for t in tunnels.values() if t.get("id") is not None}
+
+    try:
+        sa_result = client.op("<show><vpn><ipsec-sa/></vpn></show>")
+        for entry in sa_result.iter("entry"):
+            e = _entry_to_dict(entry)
+            name = e.get("name", "")
+            if not name:
+                continue
+            sa = {
+                "proxy_id": name.split(":", 1)[1] if ":" in name else "",
+                "tid": _to_int(e.get("tid")),
+                "gwid": _to_int(e.get("gwid")),
+                "spi_in": e.get("i-spi") or e.get("i_spi") or "",
+                "spi_out": e.get("o-spi") or e.get("o_spi") or "",
+                "proto": e.get("proto", ""),
+                "enc": e.get("enc", ""),
+                "hash": e.get("hash", ""),
+                "remain_sec": _to_int(e.get("remain")),
+                "life_sec": _to_int(e.get("life")),
+                "remain_kb": _to_int(e.get("remain-kb") or e.get("remaining-kb")),
+                "life_kb": _to_int(e.get("life-kb") or e.get("lifesize-kb")),
+            }
+            # PAN-OS names both the flow entry and the SA '<tunnel>:<proxy-id>'.
+            # Match on the full name first, then on the tunnel id the two share,
+            # and only then on the part before the colon (older releases name
+            # the flow entry without the proxy-id).
+            tunnel = tunnels.get(name)
+            if tunnel is None and sa["tid"] is not None:
+                tunnel = tunnels_by_id.get(sa["tid"])
+            if tunnel is None:
+                tunnel = tunnels.get(name.split(":", 1)[0])
+            if tunnel is None:
+                # SA for a tunnel we did not see in the flow table
+                tunnel = tunnels.setdefault(name, {"name": name, "state": "active", "sas": []})
+            tunnel["sas"].append(sa)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"vpn: cannot read IPsec SAs: {exc}\n")
+
+    for name, proxy in collect_proxy_ids(client).items():
+        tunnel = tunnels.get(name)
+        if tunnel is not None:
+            tunnel.update(
+                {
+                    "local_networks": proxy["local"],
+                    "remote_networks": proxy["remote"],
+                    "gateway": proxy["gateway"],
+                    "crypto_profile": proxy["crypto_profile"],
+                }
+            )
+
+    ipsec_section = {"ha_passive": ha_passive, "tunnels": list(tunnels.values())}
+    return ike, ipsec_section
+
+
+# --------------------------------------------------------------------------
+# BGP
+# --------------------------------------------------------------------------
+
+# PAN-OS 11.x can run the legacy routing stack or Advanced Routing, and the
+# two answer different commands. Both are tried, in that order.
+_BGP_COMMANDS = (
+    "<show><routing><protocol><bgp><peer/></bgp></protocol></routing></show>",
+    "<show><advanced-routing><bgp><peer-status/></bgp></advanced-routing></show>",
+)
+
+# A BGP session only carries traffic in this state.
+BGP_ESTABLISHED = "established"
+
+
+def _bgp_peer_address(value: str | None) -> str:
+    """'203.0.113.1:179' -> '203.0.113.1' (the port carries no information)."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    # keep IPv6 intact: only split a trailing ':port' off an IPv4 address
+    if raw.count(":") == 1:
+        return raw.split(":", 1)[0]
+    return raw
+
+
+def _bgp_prefix_counters(entry: ET.Element) -> dict[str, int]:
+    """Totals from <prefix-counter>, which holds one <entry> per address family.
+
+    The counters sit two levels below the peer, so they are read from the XML
+    directly rather than through _entry_to_dict, which flattens one level only.
+    """
+    totals = {"received": 0, "accepted": 0, "rejected": 0, "advertised": 0}
+    found = False
+    for af in entry.findall("prefix-counter/entry"):
+        found = True
+        for key, tag in (
+            ("received", "incoming-total"),
+            ("accepted", "incoming-accepted"),
+            ("rejected", "incoming-rejected"),
+            ("advertised", "outgoing-advertised"),
+        ):
+            totals[key] += _to_int(_text(af, tag), 0) or 0
+    return totals if found else {}
+
+
+def collect_bgp(client: PanOSClient) -> dict[str, Any] | None:
+    """BGP peers and their session state. None if BGP is not configured."""
+    result = None
+    for command in _BGP_COMMANDS:
+        try:
+            result = client.op(command)
+            break
+        except PanOSError as exc:
+            sys.stderr.write(f"bgp: {command[:40]}... not available ({exc})\n")
+    if result is None:
+        return None
+
+    peers: list[dict[str, Any]] = []
+    # only the direct <entry> children are peers; the nested ones belong to
+    # <prefix-counter> and would otherwise be mistaken for peers
+    for entry in result.findall("entry"):
+        e = _entry_to_dict(entry)
+        # 'peer' and 'vr' are attributes of <entry>, not child elements
+        name = e.get("peer") or e.get("peer-name") or e.get("name") or ""
+        if not name:
+            continue
+        status = (e.get("status") or e.get("state") or "").strip()
+        counters = _bgp_prefix_counters(entry)
+        peers.append(
+            {
+                "name": name,
+                "vr": e.get("vr") or e.get("virtual-router") or "",
+                "peer_group": e.get("peer-group") or e.get("group") or "",
+                "status": status,
+                "established": status.lower() == BGP_ESTABLISHED,
+                "status_duration_sec": _to_int(e.get("status-duration")),
+                "peer_address": _bgp_peer_address(e.get("peer-address") or e.get("peer-ip")),
+                "local_address": _bgp_peer_address(e.get("local-address") or e.get("local-ip")),
+                "peer_router_id": e.get("peer-router-id") or "",
+                "remote_as": e.get("remote-as") or e.get("peer-as") or "",
+                "local_as": e.get("local-as") or "",
+                "password_set": _to_bool(e.get("password-set")),
+                "passive": _to_bool(e.get("passive")),
+                "prefix_limit": _to_int(e.get("prefix-limit")),
+                "prefixes_received": counters.get("received"),
+                "prefixes_accepted": counters.get("accepted"),
+                "prefixes_rejected": counters.get("rejected"),
+                "prefixes_sent": counters.get("advertised"),
+                # a peer that keeps re-establishing shows up here, not in 'status'
+                "flap_count": _to_int(e.get("status-flap-counts")),
+                "established_count": _to_int(e.get("established-counts")),
+                "last_error": (e.get("last-error") or "").strip(),
+                "holdtime": _to_int(e.get("holdtime")),
+                "keepalive": _to_int(e.get("keepalive")),
+            }
+        )
+    if not peers:
+        sys.stderr.write("bgp: no peers found, section not emitted\n")
+        return None
+    return {"peers": peers}
+
+
+# --------------------------------------------------------------------------
+# Licenses
+# --------------------------------------------------------------------------
+
+_LICENSE_DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y/%m/%d", "%Y-%m-%d")
+
+
+def parse_license_date(value: str) -> int | None:
+    """'March 15, 2027' -> unix timestamp (end of that day, UTC); None for 'Never'/unknown."""
+    v = (value or "").strip()
+    if not v or v.lower() in ("never", "n/a"):
+        return None
+    for fmt in _LICENSE_DATE_FORMATS:
+        try:
+            dt = datetime.datetime.strptime(v, fmt).replace(
+                hour=23, minute=59, second=59, tzinfo=datetime.UTC
+            )
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def collect_licenses(client: PanOSClient) -> dict[str, Any]:
+    result = client.op("<request><license><info/></license></request>")
+    licenses: list[dict[str, Any]] = []
+    for entry in result.iter("entry"):
+        e = _entry_to_dict(entry)
+        feature = e.get("feature") or e.get("name") or ""
+        if not feature:
+            continue
+        expires_raw = e.get("expires", "")
+        licenses.append(
+            {
+                "feature": feature,
+                "description": e.get("description", ""),
+                "serial": e.get("serial", ""),
+                "issued": e.get("issued", ""),
+                "expires": expires_raw,
+                "expires_ts": parse_license_date(expires_raw),
+                "never_expires": expires_raw.strip().lower() == "never",
+                "expired": _to_bool(e.get("expired")),
+            }
+        )
+    return {
+        "licenses": licenses,
+        "now": int(datetime.datetime.now(datetime.UTC).timestamp()),
+    }
+
+
+# --------------------------------------------------------------------------
+# GlobalProtect
+# --------------------------------------------------------------------------
+
+
+def collect_globalprotect(client: PanOSClient) -> dict[str, Any] | None:
+    """Gateway statistics. Returns None if GlobalProtect is not configured."""
+    try:
+        result = client.op(
+            "<show><global-protect-gateway><statistics/></global-protect-gateway></show>"
+        )
+    except PanOSError as exc:
+        # 'Invalid command' / no gateway configured -> no section, not an error
+        sys.stderr.write(f"globalprotect: not available ({exc})\n")
+        return None
+    gateways: list[dict[str, Any]] = []
+    # the gateways are <Gateway> elements on current releases, <entry> on older
+    nodes = list(result.iter("Gateway")) or list(result.iter("entry"))
+    for entry in nodes:
+        e = _entry_to_dict(entry)
+        name = e.get("name") or e.get("gateway") or ""
+        if not name:
+            continue
+        gateways.append(
+            {
+                "name": name,
+                "current_users": _to_int(e.get("CurrentUsers") or e.get("current-users")) or 0,
+                "previous_users": _to_int(e.get("PreviousUsers") or e.get("previous-users")) or 0,
+            }
+        )
+    return {
+        "total_current_users": _to_int(_text(result, "TotalCurrentUsers"))
+        if result.find("TotalCurrentUsers") is not None
+        else sum(g["current_users"] for g in gateways),
+        "total_previous_users": _to_int(_text(result, "TotalPreviousUsers")),
+        "gateways": gateways,
+    }
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="agent_paloalto_api",
+        description="Checkmk special agent for Palo Alto Networks firewalls (XML API)",
+    )
+    parser.add_argument("--host", required=True, help="Firewall management address")
+    parser.add_argument("--port", type=int, default=443)
+    key = parser.add_mutually_exclusive_group(required=True)
+    key.add_argument("--api-key", help="PAN-OS API key in plain text (testing only)")
+    key.add_argument(
+        "--api-key-id",
+        help="Reference to the Checkmk password store: <password-id>:<store-path>",
+    )
+    parser.add_argument(
+        "--no-cert-check", action="store_true", help="Disable TLS certificate verification"
+    )
+    parser.add_argument("--ca-bundle", help="Path to a CA bundle for TLS verification")
+    parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout in seconds")
+    parser.add_argument(
+        "--sections",
+        default=",".join(ALL_SECTIONS),
+        help="Comma separated list of sections to collect (default: all)",
+    )
+    parser.add_argument(
+        "--public-ip-network",
+        action="append",
+        default=[],
+        metavar="CIDR",
+        help=(
+            "Public network you have been allocated, e.g. '203.0.113.0/24'. One "
+            "service per network counts how many of its addresses are in use "
+            "across NAT rules, the ARP table and the interfaces; repeatable"
+        ),
+    )
+    parser.add_argument(
+        "--config-cache-age",
+        type=float,
+        default=0.0,
+        help=(
+            "Re-read 'show config running' at most every N seconds and serve the "
+            "object counts from a cache in between (0 = always read it). The "
+            "device limits and port link states are never cached."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        help="Where to keep the cache (default: $OMD_ROOT/var/check_mk/paloalto_api)",
+    )
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--version", action="version", version=__version__)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_arguments(argv)
+    sections = {s.strip() for s in args.sections.split(",") if s.strip()}
+    unknown = sections - set(ALL_SECTIONS)
+    if unknown:
+        sys.stderr.write(f"Unknown section(s): {', '.join(sorted(unknown))}\n")
+        return 2
+
+    api_key = _resolve_api_key(args.api_key, args.api_key_id)
+    verify: bool | str = True
+    if args.no_cert_check:
+        verify = False
+    elif args.ca_bundle:
+        verify = args.ca_bundle
+
+    client = PanOSClient(
+        args.host,
+        api_key,
+        port=args.port,
+        verify=verify,
+        timeout=args.timeout,
+        debug=args.debug,
+    )
+
+    exit_code = 0
+
+    # The system section doubles as the connectivity check: if it fails we
+    # bail out, because nothing else will work either.
+    try:
+        system = collect_system(client)
+        emit_section("system", system)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"Cannot query {args.host}: {exc}\n")
+        return 2
+
+    ha_passive = False
+    if "ha" in sections or "vpn" in sections:
+        try:
+            ha = collect_ha(client)
+            ha_passive = bool(ha.get("enabled")) and ha.get("local_state", "").lower() in (
+                "passive",
+                "non-functional",
+                "suspended",
+            )
+            if "ha" in sections:
+                emit_section("ha", ha)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"ha: {exc}\n")
+            exit_code = 1
+
+    if "sessions" in sections:
+        try:
+            emit_section("sessions", collect_sessions(client))
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"sessions: {exc}\n")
+            exit_code = 1
+
+    # The interface list is fetched only for the public IP check. Interface
+    # monitoring itself belongs to the SNMP checks.
+    if args.public_ip_network:
+        try:
+            public_ip = collect_public_ip(client, args.public_ip_network)
+            if public_ip is not None:
+                emit_section("public_ip", public_ip)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"public_ip: {exc}\n")
+            exit_code = 1
+
+    if "capacity" in sections:
+        try:
+            emit_section(
+                "capacity",
+                collect_capacity(
+                    client,
+                    cache_path=_cache_file(args.cache_dir, args.host, args.port),
+                    cache_age=args.config_cache_age,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"capacity: {exc}\n")
+            exit_code = 1
+
+    if "environmentals" in sections:
+        try:
+            emit_section("environmentals", collect_environmentals(client))
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"environmentals: {exc}\n")
+            exit_code = 1
+
+    if "vpn" in sections:
+        try:
+            ike, ipsec = collect_vpn(client, ha_passive)
+            emit_section("vpn_ike", ike)
+            emit_section("vpn_ipsec", ipsec)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"vpn: {exc}\n")
+            exit_code = 1
+
+    if "bgp" in sections:
+        try:
+            bgp = collect_bgp(client)
+            if bgp is not None:
+                emit_section("bgp", bgp)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"bgp: {exc}\n")
+            exit_code = 1
+
+    if "licenses" in sections:
+        try:
+            emit_section("licenses", collect_licenses(client))
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"licenses: {exc}\n")
+            exit_code = 1
+
+    if "globalprotect" in sections:
+        try:
+            gp = collect_globalprotect(client)
+            if gp is not None:
+                emit_section("globalprotect", gp)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"globalprotect: {exc}\n")
+            exit_code = 1
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

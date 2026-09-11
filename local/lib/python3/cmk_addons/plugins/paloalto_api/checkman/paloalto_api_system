@@ -1,0 +1,14 @@
+title: Palo Alto Networks: System information
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Shows model, serial number, PAN-OS version, uptime and content versions
+ (applications, threats, antivirus, WildFire, URL filtering) of a Palo Alto
+ Networks firewall queried through the PAN-OS XML API by the special agent
+ {agent_paloalto_api}. The service is always OK and mainly exists to record
+ the uptime and give a quick overview.
+
+discovery:
+ One service is created per firewall.

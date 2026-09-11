@@ -1,0 +1,16 @@
+title: Palo Alto Networks: VPN IKE gateways (phase 1)
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Monitors the IKE gateways ("show vpn gateway") of a firewall. The service is
+ OK if an IKE security association exists for the gateway ("show vpn ike-sa")
+ and CRIT (configurable) otherwise. On the passive member of an HA pair no
+ IKE SAs exist; the service is OK there by default.
+
+item:
+ The name of the IKE gateway.
+
+discovery:
+ One service is created per configured IKE gateway.

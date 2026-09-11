@@ -1,0 +1,18 @@
+title: Palo Alto Networks: VPN IPsec tunnels (phase 2)
+agents: paloalto_api
+catalog: hw/network/paloalto
+license: GPLv2
+distribution: checkmk-paloalto-api
+description:
+ Monitors the IPsec tunnels ("show vpn flow") of a firewall. The service is OK
+ if the tunnel is active and at least one IPsec security association is
+ installed ("show vpn ipsec-sa"), WARN if it is active without SA, and CRIT
+ (configurable) if the tunnel is in state init. The tunnel monitor status and
+ the remaining lifetime of the SAs are reported as well. On the passive member
+ of an HA pair tunnels are down by design; the service is OK there by default.
+
+item:
+ The name of the IPsec tunnel.
+
+discovery:
+ One service is created per configured IPsec tunnel.

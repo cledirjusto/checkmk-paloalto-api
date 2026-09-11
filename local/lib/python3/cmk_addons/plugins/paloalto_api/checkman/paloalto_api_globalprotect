@@ -1,0 +1,11 @@
+title: Palo Alto Networks: GlobalProtect gateways\nagents: paloalto_api\ncatalog: hw/network/paloalto\nlicense: GPLv2\ndistribution: checkmk-paloalto-api\ndescription:
+ Shows the number of users connected to each GlobalProtect gateway ("show
+ global-protect-gateway statistics") with optional upper and lower levels. If
+ more than one gateway exists an additional "Total" service is created. No
+ services are created on firewalls without GlobalProtect gateways.
+
+item:
+ The gateway name, or "Total".
+
+discovery:
+ One service per gateway, plus "Total" if there is more than one gateway.

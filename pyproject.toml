@@ -1,0 +1,67 @@
+[project]
+name = "checkmk-paloalto-api"
+version = "1.0.0"
+description = "Checkmk extension: monitor Palo Alto Networks firewalls through the PAN-OS XML API"
+readme = "README.md"
+authors = [{ name = "John Jimenez" }, { name = "Cledir Justo" }]
+requires-python = ">=3.12"
+license = { text = "GPL-2.0-or-later" }
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+
+# Runtime dependencies of the special agent. Both ship with an OMD site, so
+# nothing has to be installed there - this list is for development and CI.
+dependencies = [
+    "requests",
+    "urllib3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pydantic",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/cledirjusto/checkmk-paloalto-api"
+
+# The package is not installed with pip - it is built into an .mkp with
+# scripts/build_mkp.py - so no build backend is configured on purpose.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["dist"]
+# The special agent is installed without a .py suffix, so ruff has to be told
+# about it explicitly.
+extend-include = ["**/libexec/agent_paloalto_api"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "BLE",  # blind except - the agent marks its deliberate ones with noqa
+    "RUF",
+]
+ignore = [
+    "B008",    # function call in default argument - used by the Checkmk form specs
+    "RUF022",  # __all__ is grouped by topic in rulesets/check_parameters.py, not sorted
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["error::DeprecationWarning"]
