@@ -158,8 +158,8 @@ monitor, keeping the tunnel up without this side knowing.
   as usable (they do not by default; set it if the block is routed to the
   firewall rather than on-link).
 * **Palo Alto BGP peers** – state for a peer that is down versus one still
-  coming up, lower levels on session uptime to catch a flapping peer, and on
-  prefixes received.
+  coming up, state on the standby of an HA pair, lower levels on session uptime
+  to catch a flapping peer, and on prefixes received.
 * **Palo Alto VPN IKE gateways / IPsec tunnels** – state when down, state on the
   passive HA member, remaining SA lifetime, and for grouped services the lower
   levels on active tunnels per gateway.
@@ -167,6 +167,25 @@ monitor, keeping the tunnel up without this side knowing.
   out-of-sync.
 * **Palo Alto licenses**, **throughput**, **power supplies**, **GlobalProtect
   gateways**.
+
+### 7. Monitoring both members of an HA pair
+
+Each firewall is its own host, with its own management address and its own
+special agent rule. The standby cannot be reached through the active member,
+and the two do not report the same thing.
+
+Two points that are easy to miss:
+
+* **The discovery rule from step 5 has to cover both members.** If it names
+  hosts, add the standby to the list. In a pair where one member groups IPsec
+  tunnels by gateway and the other creates one service per tunnel, the service
+  list changes on every failover.
+* **On the standby, BGP peers and VPN tunnels report OK while they are down.**
+  A firewall that is not the active member keeps its dataplane links down and
+  runs no routing protocol, so nothing comes up until it takes over. Those
+  services carry `HA passive member` in their summary, and step 6 lets you make
+  the standby alarm instead. The `HA State` service tells you which member you
+  are looking at.
 
 ## Cost, and the configuration cache
 
