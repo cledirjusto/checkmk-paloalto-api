@@ -135,6 +135,11 @@ def test_collect_vpn_phase1_and_phase2(agent, client):
     assert tunnels["tun-branch-b"]["sas"] == []
 
 
+def test_collect_bgp_marks_the_passive_member(agent, client):
+    assert agent.collect_bgp(client, ha_passive=True)["ha_passive"] is True
+    assert agent.collect_bgp(client, ha_passive=False)["ha_passive"] is False
+
+
 def test_collect_vpn_marks_the_passive_member(agent, client):
     ike, ipsec = agent.collect_vpn(client, ha_passive=True)
     assert ike["ha_passive"] is True
@@ -283,7 +288,7 @@ def test_cache_file_is_not_world_readable(agent, tmp_path):
 
 def test_collect_bgp_reads_the_peer_name_from_the_entry_attributes(agent, client):
     """'peer' and 'vr' are attributes of <entry>, not child elements."""
-    peers = {p["name"]: p for p in agent.collect_bgp(client)["peers"]}
+    peers = {p["name"]: p for p in agent.collect_bgp(client, ha_passive=False)["peers"]}
     assert set(peers) == {"core-01", "border-01", "edge-01"}
     assert peers["core-01"]["vr"] == "default"
     assert peers["core-01"]["peer_group"] == "cores"
@@ -291,12 +296,12 @@ def test_collect_bgp_reads_the_peer_name_from_the_entry_attributes(agent, client
 
 def test_collect_bgp_does_not_mistake_prefix_counters_for_peers(agent, client):
     """<prefix-counter> holds <entry> elements that must not become services."""
-    peers = agent.collect_bgp(client)["peers"]
+    peers = agent.collect_bgp(client, ha_passive=False)["peers"]
     assert len(peers) == 3, "the nested prefix-counter entries are not peers"
 
 
 def test_collect_bgp_reads_the_nested_prefix_counters(agent, client):
-    peers = {p["name"]: p for p in agent.collect_bgp(client)["peers"]}
+    peers = {p["name"]: p for p in agent.collect_bgp(client, ha_passive=False)["peers"]}
     core = peers["core-01"]
     assert core["prefixes_received"] == 0
     assert core["prefixes_accepted"] == 0
@@ -310,13 +315,13 @@ def test_collect_bgp_reads_the_nested_prefix_counters(agent, client):
 
 
 def test_collect_bgp_strips_the_port_from_the_addresses(agent, client):
-    peers = {p["name"]: p for p in agent.collect_bgp(client)["peers"]}
+    peers = {p["name"]: p for p in agent.collect_bgp(client, ha_passive=False)["peers"]}
     assert peers["core-01"]["peer_address"] == "203.0.113.63"
     assert peers["core-01"]["local_address"] == "203.0.113.54"
 
 
 def test_collect_bgp_state_and_flaps(agent, client):
-    peers = {p["name"]: p for p in agent.collect_bgp(client)["peers"]}
+    peers = {p["name"]: p for p in agent.collect_bgp(client, ha_passive=False)["peers"]}
     assert peers["core-01"]["established"] is True
     assert peers["core-01"]["status_duration_sec"] == 2020586
     assert peers["edge-01"]["established"] is False
@@ -336,7 +341,7 @@ def test_collect_bgp_falls_back_when_advanced_routing_is_off(agent):
                 raise agent.PanOSError("advanced routing mode is not enabled")
             return super().op(cmd)
 
-    assert agent.collect_bgp(Legacy()) is not None
+    assert agent.collect_bgp(Legacy(), ha_passive=False) is not None
     assert any("<routing><protocol><bgp>" in c for c in calls)
 
 
@@ -347,7 +352,7 @@ def test_collect_bgp_returns_none_when_not_configured(agent):
                 raise agent.PanOSError("Invalid command")
             return super().op(cmd)
 
-    assert agent.collect_bgp(NoBgp()) is None
+    assert agent.collect_bgp(NoBgp(), ha_passive=False) is None
 
 
 def test_bgp_peer_address_keeps_ipv6_intact(agent):

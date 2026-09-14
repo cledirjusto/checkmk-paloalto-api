@@ -510,6 +510,20 @@ def _bgp_form() -> Dictionary:
                     prefill=DefaultValue(ServiceState.WARN),
                 ),
             ),
+            "state_down_passive": DictElement(
+                parameter_form=ServiceState(
+                    title=Title("State if the session is not established on the standby"),
+                    help_text=Help(
+                        "A firewall that is not the active member of an HA pair keeps "
+                        "its dataplane links down and runs no routing protocol, so "
+                        "every peer sits in Idle until it takes over. This state "
+                        "replaces the two above whenever the HA state is passive, "
+                        "non-functional or suspended. Active/active pairs are not "
+                        "affected: there both members peer."
+                    ),
+                    prefill=DefaultValue(ServiceState.OK),
+                ),
+            ),
             "levels_uptime": DictElement(
                 parameter_form=SimpleLevels(
                     title=Title("Lower levels on how long the session has been up"),

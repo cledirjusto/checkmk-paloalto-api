@@ -6,6 +6,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-14
+
+### Fixed
+
+- `BGP Peer <name>` no longer alarms on the standby of an HA pair. A firewall
+  that is not the active member keeps its dataplane links down and runs no
+  routing protocol, so every peer sits in Idle for as long as that lasts;
+  `Idle` is in the transient state list, so all of them reported WARN forever
+  on `hq-fw02`.
+
+  This is the same problem the VPN checks already solved, so it is fixed the
+  same way rather than a second way: the agent decides once, from the HA state,
+  and sets `ha_passive` on the BGP section as it already does on the two VPN
+  sections. That also means BGP inherits the states the VPN checks already
+  covered - `passive`, `non-functional` and `suspended`, not just `passive` -
+  and the parameter is named `state_down_passive` like theirs.
+
+  The lower levels on session uptime and prefixes received are skipped on the
+  standby too, so levels set for the active member cannot fire there.
+
+  Active/active is deliberately untouched: both members peer there and the
+  local state is `active-primary` or `active-secondary`, never passive, so a
+  peer that is down on either one is still a real failure.
+
+  Verified against the real pair: `hq-fw02` in `passive` state reports its
+  three peers as OK, `hq-fw01` still reports the same three as Established, and
+  the stub host, which is `active`, still warns on a peer in `Active`.
+
+### Added
+
+- `State if the session is not established on the standby` in the rule "Palo
+  Alto BGP peers", defaulting to OK, for anyone who does want the standby to
+  alarm.
+
 ## [1.0.1] - 2026-09-11
 
 ### Fixed

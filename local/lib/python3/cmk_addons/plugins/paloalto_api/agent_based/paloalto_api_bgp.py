@@ -25,17 +25,34 @@ from cmk.agent_based.v2 import (
     render,
 )
 
-Section = Mapping[str, Mapping[str, Any]]
-
 # States a peer passes through on its way up. Anything else is a hard failure.
 TRANSIENT_STATES = ("idle", "connect", "active", "opensent", "openconfirm")
 
+_NO_LEVELS = ("no_levels", None)
 
-def parse_paloalto_api_bgp(string_table: StringTable) -> Section | None:
+
+class BgpSection:
+    """The peers, plus whether this firewall is the standby of an HA pair.
+
+    A member that is not active keeps its dataplane links down and runs no
+    routing protocol, so every peer sits in Idle for as long as that lasts.
+    The agent decides this once, from the HA state, and sets the same flag on
+    the VPN sections.
+    """
+
+    def __init__(self, ha_passive: bool, peers: Mapping[str, dict[str, Any]]) -> None:
+        self.ha_passive = ha_passive
+        self.peers = peers
+
+
+def parse_paloalto_api_bgp(string_table: StringTable) -> BgpSection | None:
     if not string_table or not string_table[0]:
         return None
     raw = json.loads(string_table[0][0])
-    return {p["name"]: p for p in raw.get("peers", []) if p.get("name")}
+    return BgpSection(
+        ha_passive=bool(raw.get("ha_passive")),
+        peers={p["name"]: p for p in raw.get("peers", []) if p.get("name")},
+    )
 
 
 agent_section_paloalto_api_bgp = AgentSection(
@@ -44,27 +61,38 @@ agent_section_paloalto_api_bgp = AgentSection(
 )
 
 
-def discover_bgp(section: Section) -> DiscoveryResult:
-    for name in section:
+def discover_bgp(section: BgpSection) -> DiscoveryResult:
+    # Peers are discovered on the standby too: it becomes the active member on
+    # failover, and the section lists them either way.
+    for name in section.peers:
         yield Service(item=name)
 
 
-def check_bgp(item: str, params: Mapping[str, Any], section: Section) -> CheckResult:
-    peer = section.get(item)
+def check_bgp(item: str, params: Mapping[str, Any], section: BgpSection) -> CheckResult:
+    peer = section.peers.get(item)
     if peer is None:
         return
 
     status = (peer.get("status") or "unknown").strip()
-    if peer.get("established"):
+    established = bool(peer.get("established"))
+    # only while the session is down does being the standby explain anything
+    standby = not established and section.ha_passive
+
+    if established:
         yield Result(state=State.OK, summary=f"Session: {status}")
         yield Metric("paloalto_bgp_established", 1)
     else:
-        # a peer on its way up is not the same as one that will not come up
-        transient = status.lower() in TRANSIENT_STATES
-        state = State(
-            params.get("state_transient", 1) if transient else params.get("state_down", 2)
-        )
-        yield Result(state=state, summary=f"Session: {status}")
+        summary = f"Session: {status}"
+        if standby:
+            state = State(params.get("state_down_passive", 0))
+            summary += " - HA passive member"
+        else:
+            # a peer on its way up is not the same as one that will not come up
+            transient = status.lower() in TRANSIENT_STATES
+            state = State(
+                params.get("state_transient", 1) if transient else params.get("state_down", 2)
+            )
+        yield Result(state=state, summary=summary)
         yield Metric("paloalto_bgp_established", 0)
 
     if peer.get("remote_as"):
@@ -77,7 +105,7 @@ def check_bgp(item: str, params: Mapping[str, Any], section: Section) -> CheckRe
         # a session that just came up is worth noticing: it means it flapped
         yield from check_levels(
             float(duration),
-            levels_lower=params.get("levels_uptime"),
+            levels_lower=_NO_LEVELS if standby else params.get("levels_uptime"),
             metric_name="paloalto_bgp_uptime",
             label="Session for",
             render_func=render.timespan,
@@ -89,7 +117,7 @@ def check_bgp(item: str, params: Mapping[str, Any], section: Section) -> CheckRe
     if received is not None:
         yield from check_levels(
             received,
-            levels_lower=params.get("levels_prefixes"),
+            levels_lower=_NO_LEVELS if standby else params.get("levels_prefixes"),
             metric_name="paloalto_bgp_prefixes_received",
             label="Prefixes received",
             render_func=(
@@ -145,13 +173,13 @@ def check_bgp(item: str, params: Mapping[str, Any], section: Section) -> CheckRe
 check_plugin_paloalto_api_bgp = CheckPlugin(
     name="paloalto_api_bgp",
     service_name="BGP Peer %s",
-    sections=["paloalto_api_bgp"],
     discovery_function=discover_bgp,
     check_function=check_bgp,
     check_ruleset_name="paloalto_api_bgp",
     check_default_parameters={
         "state_down": 2,
         "state_transient": 1,
+        "state_down_passive": 0,
         "levels_uptime": ("no_levels", None),
         "levels_prefixes": ("no_levels", None),
         "levels_prefix_limit_pct": ("no_levels", None),

@@ -13,6 +13,16 @@ description:
  lower levels on the session uptime, which catches a peer that keeps
  flapping, and on the number of prefixes received.
 
+ On the standby of an HA pair every peer sits in Idle: the firewall keeps its
+ dataplane links down and runs no routing protocol until it takes over. The
+ agent reports the HA state alongside the peers, and the check treats a peer
+ that is not established as OK whenever that state is passive, non-functional
+ or suspended, so the standby does not alarm. The state is configurable as
+ "State if the session is not established on the standby", and the lower
+ levels on uptime and prefixes received are not applied there. This is the
+ same handling the VPN checks use. Active/active pairs are unaffected: both
+ members peer, so neither is excused.
+
  PAN-OS does not expose BGP peer state over SNMP, so this has no equivalent
  among the SNMP based checks.
 

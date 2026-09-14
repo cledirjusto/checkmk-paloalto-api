@@ -73,7 +73,7 @@ from typing import Any
 import requests
 import urllib3
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 ALL_SECTIONS = (
     "system",
@@ -943,7 +943,7 @@ def _bgp_prefix_counters(entry: ET.Element) -> dict[str, int]:
     return totals if found else {}
 
 
-def collect_bgp(client: PanOSClient) -> dict[str, Any] | None:
+def collect_bgp(client: PanOSClient, ha_passive: bool) -> dict[str, Any] | None:
     """BGP peers and their session state. None if BGP is not configured."""
     result = None
     for command in _BGP_COMMANDS:
@@ -997,7 +997,7 @@ def collect_bgp(client: PanOSClient) -> dict[str, Any] | None:
     if not peers:
         sys.stderr.write("bgp: no peers found, section not emitted\n")
         return None
-    return {"peers": peers}
+    return {"ha_passive": ha_passive, "peers": peers}
 
 
 # --------------------------------------------------------------------------
@@ -1187,7 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     ha_passive = False
-    if "ha" in sections or "vpn" in sections:
+    if "ha" in sections or "vpn" in sections or "bgp" in sections:
         try:
             ha = collect_ha(client)
             ha_passive = bool(ha.get("enabled")) and ha.get("local_state", "").lower() in (
@@ -1251,7 +1251,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if "bgp" in sections:
         try:
-            bgp = collect_bgp(client)
+            bgp = collect_bgp(client, ha_passive)
             if bgp is not None:
                 emit_section("bgp", bgp)
         except Exception as exc:  # noqa: BLE001
